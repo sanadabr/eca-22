@@ -1,17 +1,44 @@
-from fastapi import FastAPI, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from openai import OpenAI
-import uvicorn
-from pathlib import Path
-import tempfile
-from typing import Optional, List, Dict
-from dotenv import load_dotenv
-import os
 import base64
+import os
+import tempfile
+from pathlib import Path
+from typing import Dict, List, Optional
 
-# Load environment variables
-load_dotenv()
+import uvicorn
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from openai import OpenAI
+
+BASE_DIR = Path(__file__).resolve().parent
+
+# Load .env from the project folder, whatever directory the server is started from
+load_dotenv(BASE_DIR / ".env")
+
+# Models can be overridden in .env. The defaults are the ones this project's key can use.
+TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-5-nano")
+TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
+TTS_VOICE = os.getenv("TTS_VOICE", "alloy")
+
+# Audio containers the transcription API accepts. The browser records webm (Chrome/Firefox)
+# or mp4 (Safari); the file extension must match the real format or the API rejects it.
+ALLOWED_AUDIO_SUFFIXES = {".webm", ".ogg", ".mp4", ".m4a", ".mp3", ".mpeg", ".mpga", ".wav", ".flac"}
+DEFAULT_AUDIO_SUFFIX = ".webm"
+MAX_HISTORY_MESSAGES = 20
+
+
+def load_api_key() -> str:
+    key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if not key:
+        raise SystemExit(f"OPENAI_API_KEY is missing. Put it in {BASE_DIR / '.env'}")
+    if not key.startswith("sk-"):
+        raise SystemExit(
+            "OPENAI_API_KEY does not start with 'sk-' (check for a capital S or stray characters in .env)"
+        )
+    return key
+
 
 app = FastAPI()
 
@@ -24,112 +51,115 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize OpenAI client
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+client = OpenAI(api_key=load_api_key())
 
 # Simple in-memory chat history
 chat_history: List[Dict[str, str]] = []
 
 
-def transcribe_audio(audio_path: str) -> Optional[str]:
-    """Convert speech to text using OpenAI's Whisper"""
-    try:
-        with open(audio_path, "rb") as audio:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio,
-                response_format="text"
-            )
-        return transcript
-    except Exception as e:
-        print(f"Transcription error: {e}")
-        return None
+def audio_suffix(filename: Optional[str]) -> str:
+    suffix = Path(filename or "").suffix.lower()
+    return suffix if suffix in ALLOWED_AUDIO_SUFFIXES else DEFAULT_AUDIO_SUFFIX
 
 
-def process_with_llm(text: str) -> Optional[str]:
-    """Process text with LLM using conversation history"""
-    try:
-        # Build messages with history
-        messages = [
-            {"role": "system", "content": "You are a helpful voice assistant. Keep responses concise and natural."}
-        ] + chat_history + [{"role": "user", "content": text}]
-
-        # Get response from GPT
-        chat_completion = client.chat.completions.create(
-            model="gpt-3.5-turbo-1106",
-            messages=messages
+def transcribe_audio(audio_path: str) -> str:
+    """Convert speech to text."""
+    with open(audio_path, "rb") as audio:
+        transcript = client.audio.transcriptions.create(
+            model=TRANSCRIBE_MODEL,
+            file=audio,
+            response_format="text",
         )
-
-        response = chat_completion.choices[0].message.content
-
-        # Update history
-        chat_history.append({"role": "user", "content": text})
-        chat_history.append({"role": "assistant", "content": response})
-
-        # Keep only last 10 exchanges (20 messages) to manage context length
-        while len(chat_history) > 20:
-            chat_history.pop(0)
-
-        return response
-    except Exception as e:
-        print(f"LLM processing error: {e}")
-        return None
+    return transcript.strip()
 
 
-def convert_to_speech(text: str) -> Optional[bytes]:
-    """Convert text to speech using OpenAI's TTS"""
-    try:
-        speech_response = client.audio.speech.create(
-            model="tts-1",
-            voice="alloy",
-            input=text
-        )
-        return speech_response.content
-    except Exception as e:
-        print(f"Text-to-speech error: {e}")
-        return None
+def process_with_llm(text: str) -> str:
+    """Answer the user, using the conversation history."""
+    global chat_history
+    messages = [
+        {"role": "system", "content": "You are a helpful voice assistant. Keep responses concise and natural."}
+    ] + chat_history + [{"role": "user", "content": text}]
+
+    # gpt-5 models reason before answering; keep that minimal so the voice reply is quick
+    extra_body = {"reasoning_effort": "minimal"} if CHAT_MODEL.startswith("gpt-5") else None
+    chat_completion = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=messages,
+        extra_body=extra_body,
+    )
+    response = (chat_completion.choices[0].message.content or "").strip()
+
+    chat_history = (chat_history + [
+        {"role": "user", "content": text},
+        {"role": "assistant", "content": response},
+    ])[-MAX_HISTORY_MESSAGES:]
+    return response
+
+
+def convert_to_speech(text: str) -> bytes:
+    """Convert text to speech (mp3)."""
+    speech_response = client.audio.speech.create(
+        model=TTS_MODEL,
+        voice=TTS_VOICE,
+        input=text,
+    )
+    return speech_response.content
+
+
+def error_response(step: str, error: Exception) -> JSONResponse:
+    print(f"{step} error: {error}")
+    return JSONResponse(content={"error": f"{step} failed: {error}"}, status_code=500)
 
 
 @app.post("/process-voice")
 async def process_voice(audio_file: UploadFile = File(...)):
+    content = await audio_file.read()
+    if not content:
+        return JSONResponse(content={"error": "No audio received"}, status_code=400)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=audio_suffix(audio_file.filename)) as temp_audio:
+        temp_audio.write(content)
+        temp_audio_path = temp_audio.name
+
     try:
-        # Save uploaded audio file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
-            content = await audio_file.read()
-            temp_audio.write(content)
-            temp_audio_path = temp_audio.name
-
-        # Step 1: Speech to Text
-        transcript = transcribe_audio(temp_audio_path)
+        try:
+            transcript = transcribe_audio(temp_audio_path)
+        except Exception as e:
+            return error_response("Transcription", e)
         if not transcript:
-            return JSONResponse(content={"error": "Transcription failed"}, status_code=500)
+            return JSONResponse(content={"error": "Didn't catch any speech, try again"}, status_code=422)
 
-        # Step 2: Process with LLM
-        response_text = process_with_llm(transcript)
-        if not response_text:
-            return JSONResponse(content={"error": "LLM processing failed"}, status_code=500)
+        try:
+            response_text = process_with_llm(transcript)
+        except Exception as e:
+            return error_response("LLM processing", e)
 
-        # Step 3: Text to Speech
-        audio_content = convert_to_speech(response_text)
-        if not audio_content:
-            return JSONResponse(content={"error": "Text-to-speech conversion failed"}, status_code=500)
+        try:
+            audio_content = convert_to_speech(response_text)
+        except Exception as e:
+            return error_response("Text-to-speech", e)
+    finally:
+        Path(temp_audio_path).unlink(missing_ok=True)
 
-        # Cleanup temporary audio file
-        Path(temp_audio_path).unlink()
+    return JSONResponse(content={
+        "transcript": transcript,
+        "response_text": response_text,
+        "audio": base64.b64encode(audio_content).decode("utf-8"),
+        "history": chat_history,
+    })
 
-        # Encode audio content as base64
-        audio_base64 = base64.b64encode(audio_content).decode('utf-8')
 
-        return JSONResponse(content={
-            "transcript": transcript,
-            "response_text": response_text,
-            "audio": audio_base64,
-            "history": chat_history
-        })
+# Serve the page from the same server, so the mic works at http://localhost:8000
+@app.get("/")
+async def index():
+    return FileResponse(BASE_DIR / "index.html")
 
-    except Exception as e:
-        print(f"Error in process_voice: {e}")
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+@app.get("/frames.json")
+async def frames():
+    return FileResponse(BASE_DIR / "frames.json")
+
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    print("Open http://localhost:8000 in Chrome, Firefox or Safari")
+    uvicorn.run(app, host="127.0.0.1", port=8000)

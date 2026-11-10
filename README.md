@@ -31,19 +31,20 @@ pip install -r requirements.txt
 OPENAI_API_KEY=your_api_key_here
 ```
 
+The key must start with lowercase `sk-`. Optional overrides (defaults shown):
+```
+TRANSCRIBE_MODEL=gpt-4o-mini-transcribe
+CHAT_MODEL=gpt-5-nano
+TTS_MODEL=gpt-4o-mini-tts
+TTS_VOICE=alloy
+```
+
 ### Running the Application
 
-1. Start the backend server in a terminal window:
+1. Start the server (it serves both the API and the page):
 ```bash
 python main.py
 ```
 
-2. Open a new terminal window and start the frontend server on port 3000
-```bash
-python -m http.server 3000
-```
-
-3. Open your browser of choice and navigate to:
-```
-http://localhost:3000
-```
+2. Open http://localhost:8000 in Chrome, Firefox or Safari and allow microphone access.
+   Use `localhost`, not a `file://` path, or the browser blocks the microphone.
